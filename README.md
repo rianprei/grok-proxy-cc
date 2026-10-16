@@ -68,6 +68,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 upx --best --lzma target/release/grok-proxy-cc   # optional
 
 # 2. Generate a local auth token
+mkdir -p ~/.config/grok-proxy-cc
 echo "GROK_MASTER_KEY=$(cat /proc/sys/kernel/random/uuid | tr -d '-')" \
   > ~/.config/grok-proxy-cc/proxy.env
 chmod 600 ~/.config/grok-proxy-cc/proxy.env
@@ -156,6 +157,8 @@ See [deploy/grok-proxy-cc.service](deploy/grok-proxy-cc.service) for a
 production unit with full hardening and resource tuning:
 
 ```sh
+mkdir -p ~/.local/bin
+cp target/release/grok-proxy-cc ~/.local/bin/
 cp deploy/grok-proxy-cc.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now grok-proxy-cc

@@ -1,6 +1,6 @@
 # Architecture
 
-Single-file Rust proxy (~1000 lines in `src/main.rs`), born at maximum
+Single-file Rust proxy (~1550 lines in `src/main.rs`), born at maximum
 optimization. No axum, no tracing, no uuid, no chrono, no anyhow, no clap.
 
 ## Design principles
@@ -11,8 +11,8 @@ optimization. No axum, no tracing, no uuid, no chrono, no anyhow, no clap.
 2. **tokio `current_thread`** — loopback single-user proxy; the multi-thread
    scheduler's synchronization overhead is pure waste here.
 3. **`futures-core`** — only the `Stream` trait, not the full futures-util.
-4. **`eprintln!`** — direct stderr logging; `RUST_LOG` semantics are handled
-   by a ~35-line init function, not the `env_logger` tree.
+4. **`eprintln!`** — direct stderr logging; no logger framework, no
+   `RUST_LOG` parsing — stderr is all this proxy needs.
 5. **Fail-closed everywhere** — quota is terminal, unknown models 404,
    no silent fallback to another provider, ever.
 
@@ -33,9 +33,11 @@ route() ── constant-time Bearer check ──► 401 if no/wrong token
         │
         ▼
     convert_to_chat()  Anthropic → OpenAI Chat Completions
-        │              - system → messages[0].role=system
+        │              - system (string or text-block array) → messages[0]
         │              - tool_result in role:user → role:tool
         │              - tool_use → tool_calls
+        │              - tool_choice any/none/tool → required/none/function
+        │              - model `:effort` suffix → reasoning_effort
         │              - output_config.effort → reasoning_effort
         │              - thinking.budget_tokens → reasoning_effort (coarse)
         │
@@ -102,8 +104,8 @@ Same-provider, opt-out via `GROK_CHAIN` env (default:
 
 | Stage | Size |
 |-------|------|
-| Source | ~1000 lines, 11 direct deps |
-| `cargo build --release` (opt=3, LTO fat, codegen-units=1, strip) | 3.1 MB |
+| Source | ~1550 lines, 11 direct deps |
+| `cargo build --release` (opt=3, LTO fat, codegen-units=1, strip) | 3.2 MB |
 | `upx --best --lzma` | **1.2 MB** |
 
 The `ring` crate (rustls) dominates the binary; everything else is a rounding
@@ -111,13 +113,15 @@ error. `target-cpu=native` adds AES-NI acceleration for the TLS hot path.
 
 ## Test coverage
 
-15 unit tests covering:
+25 unit tests covering:
 
-- Model resolution (`claude-grok-4.7` → `grok-4.7`)
-- Conversion (basic, system, tool_result, tools, effort from output_config
-  and thinking, garbage effort rejection)
+- Model resolution (`claude-grok-4.7` → `grok-4.7`, `:effort` suffix split)
+- Conversion (basic, system string + text-block array, tool_result —
+  string and block-array content, sibling text preserved, tools,
+  tool_choice mapping, effort from suffix/output_config/thinking,
+  garbage effort rejection)
 - Quota detection
 - Token estimation (ASCII + CJK)
 - UTF-8-safe SSE line extraction
 - Constant-time auth comparison
-- SSE event format
+- SSE event format (incl. tool_use start with id/name, usage delta)

@@ -179,6 +179,16 @@ fn resolve_slug(model_id: &str) -> String {
         .to_string()
 }
 
+/// `grok-4.7:high` → (`grok-4.7`, Some("high")). The suffix only splits when
+/// it is a valid effort (low|medium|high); otherwise it stays part of the
+/// slug (and fails model validation, as it should).
+fn split_effort(slug: &str) -> (&str, Option<&str>) {
+    match slug.rsplit_once(':') {
+        Some((base, effort)) if matches!(effort, "low" | "medium" | "high") => (base, Some(effort)),
+        _ => (slug, None),
+    }
+}
+
 fn is_valid_slug(slug: &str) -> bool {
     MODELS.iter().any(|(s, _)| *s == slug)
 }
@@ -191,21 +201,50 @@ fn is_quota_exhaustion(body: &str) -> bool {
 
 // ─── Conversion: Anthropic Messages → OpenAI Chat Completions ─────────────
 
+/// Anthropic tool_result content → string (string content, or the text
+/// blocks inside array content, joined).
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
 fn convert_to_chat(req: &Value) -> Value {
     let mut out = json!({"stream": true});
     let obj = out.as_object_mut().unwrap();
 
-    // Model
-    let slug = resolve_slug(
+    // Model (`claude-grok-4.7:high` → slug `grok-4.7` + effort `high`)
+    let raw_slug = resolve_slug(
         req.get("model")
             .and_then(Value::as_str)
             .unwrap_or("grok-4.7"),
     );
+    let (slug, suffix_effort) = split_effort(&raw_slug);
     obj.insert("model".into(), json!(slug));
 
-    // System → first message
-    if let Some(sys) = req.get("system").and_then(Value::as_str) {
-        obj.insert("messages".into(), json!([{"role":"system","content":sys}]));
+    // System → first message (string, or array of text blocks —
+    // modern Claude Code sends the array form with cache_control)
+    if let Some(sys) = req.get("system") {
+        let sys_text: Option<String> = match sys {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(arr) => {
+                let parts: Vec<&str> = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("\n"))
+            }
+            _ => None,
+        };
+        if let Some(s) = sys_text {
+            obj.insert("messages".into(), json!([{"role":"system","content":s}]));
+        }
     }
 
     // Messages
@@ -215,38 +254,43 @@ fn convert_to_chat(req: &Value) -> Value {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
             match role {
                 "user" => {
-                    // Check if content contains tool_result blocks (Claude Code sends them in role:user)
+                    // Claude Code sends tool_result blocks inside role:"user".
+                    // Each becomes role:tool; sibling text blocks must NOT be
+                    // dropped — they become a trailing user message.
                     let content = m.get("content");
-                    if let Some(arr) = content.and_then(Value::as_array) {
-                        let tool_results: Vec<Value> = arr
-                            .iter()
-                            .filter(|b| {
-                                b.get("type").and_then(Value::as_str) == Some("tool_result")
-                            })
-                            .cloned()
-                            .collect();
-                        if !tool_results.is_empty() {
-                            // Each tool_result becomes a role:tool message
-                            for tr in &tool_results {
-                                let tool_call_id =
-                                    tr.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                                let content_str = if let Some(s) =
-                                    tr.get("content").and_then(Value::as_str)
-                                {
-                                    s.to_string()
-                                } else if let Some(a) = tr.get("content").and_then(Value::as_array)
-                                {
-                                    a.iter()
-                                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                        .collect::<Vec<_>>()
-                                        .join("")
-                                } else {
-                                    String::new()
-                                };
-                                msgs.push(json!({"role":"tool","tool_call_id":tool_call_id,"content":content_str}));
+                    let has_tool_results = content.and_then(Value::as_array).is_some_and(|arr| {
+                        arr.iter()
+                            .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    });
+                    if has_tool_results {
+                        if let Some(arr) = content.and_then(Value::as_array) {
+                            let mut text_parts: Vec<&str> = Vec::new();
+                            for b in arr {
+                                match b.get("type").and_then(Value::as_str) {
+                                    Some("tool_result") => {
+                                        let tool_call_id = b
+                                            .get("tool_use_id")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
+                                        msgs.push(json!({
+                                            "role":"tool",
+                                            "tool_call_id":tool_call_id,
+                                            "content":tool_result_text(b)
+                                        }));
+                                    }
+                                    Some("text") => {
+                                        text_parts.push(
+                                            b.get("text").and_then(Value::as_str).unwrap_or(""),
+                                        );
+                                    }
+                                    _ => {}
+                                }
                             }
-                            continue;
+                            if !text_parts.is_empty() {
+                                msgs.push(json!({"role":"user","content":text_parts.join("\n")}));
+                            }
                         }
+                        continue;
                     }
                     let content = convert_content_to_text(m.get("content"));
                     msgs.push(json!({"role":"user","content":content}));
@@ -293,19 +337,8 @@ fn convert_to_chat(req: &Value) -> Value {
                 "tool" | "tool_result" => {
                     // tool_result from Anthropic becomes role:tool
                     let tool_call_id = m.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                    let content = m.get("content");
-                    let content_str = if let Some(s) = content.and_then(Value::as_str) {
-                        s.to_string()
-                    } else if let Some(a) = content.and_then(Value::as_array) {
-                        a.iter()
-                            .filter_map(|b| b.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    } else {
-                        String::new()
-                    };
                     msgs.push(
-                        json!({"role":"tool","tool_call_id":tool_call_id,"content":content_str}),
+                        json!({"role":"tool","tool_call_id":tool_call_id,"content":tool_result_text(m)}),
                     );
                 }
                 _ => {}
@@ -339,17 +372,32 @@ fn convert_to_chat(req: &Value) -> Value {
             .collect();
         if !converted.is_empty() {
             obj.insert("tools".into(), json!(converted));
-            obj.insert("tool_choice".into(), json!("auto"));
+            // tool_choice: auto | any→required | tool→forced function | none
+            let choice = match req.pointer("/tool_choice/type").and_then(Value::as_str) {
+                Some("any") => json!("required"),
+                Some("none") => json!("none"),
+                Some("tool") => {
+                    let name = req
+                        .pointer("/tool_choice/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    json!({"type":"function","function":{"name":name}})
+                }
+                _ => json!("auto"),
+            };
+            obj.insert("tool_choice".into(), choice);
         }
     }
 
-    // Effort: output_config.effort (native slider) → reasoning_effort
+    // Effort precedence: output_config.effort (native slider) → `:effort`
+    // model suffix → thinking.budget_tokens coarse mapping.
     // The Grok API accepts reasoning_effort: low|medium|high
     if let Some(effort) = req
         .get("output_config")
         .and_then(|oc| oc.get("effort"))
         .and_then(Value::as_str)
         .filter(|e| matches!(*e, "low" | "medium" | "high"))
+        .or(suffix_effort)
         .or_else(|| {
             // Fallback: thinking.budget_tokens mapped coarsely
             req.get("thinking")
@@ -434,9 +482,9 @@ fn message_start(model: &str) -> String {
 }
 
 fn content_block_start(index: usize, block_type: &str) -> String {
-    let extra = if block_type == "tool_use" {
-        json!({"name":"","input":{}})
-    } else if block_type == "thinking" {
+    // NOTE: tool_use blocks go through content_block_start_tool —
+    // they must carry id + name in the start event.
+    let extra = if block_type == "thinking" {
         json!({"thinking":""})
     } else {
         json!({"text":""})
@@ -450,6 +498,15 @@ fn content_block_start(index: usize, block_type: &str) -> String {
     sse_event(
         "content_block_start",
         &json!({"type":"content_block_start","index":index,"content_block":block}),
+    )
+}
+
+/// tool_use blocks carry the tool id and name in content_block_start —
+/// the client matches tool_result by id and dispatches by name.
+fn content_block_start_tool(index: usize, id: &str, name: &str) -> String {
+    sse_event(
+        "content_block_start",
+        &json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
     )
 }
 
@@ -481,10 +538,10 @@ fn content_block_stop(index: usize) -> String {
     )
 }
 
-fn message_delta(stop_reason: &str, output_tokens: u64) -> String {
+fn message_delta(stop_reason: &str, input_tokens: u64, output_tokens: u64) -> String {
     sse_event(
         "message_delta",
-        &json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens}}),
+        &json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens}}),
     )
 }
 
@@ -543,15 +600,29 @@ fn parse_addr() -> std::net::SocketAddr {
 
 // ─── Upstream call with chain ──────────────────────────────────────────────
 
+/// Build the upstream request. reqwest's total timeout covers the whole
+/// body read — a hard 300s cap would kill healthy long thinking generations
+/// mid-stream. Streams get a generous 1h ceiling (the pump's MAX_STREAM_IDLE
+/// watchdog handles dead streams); non-streaming JSON keeps the hard 300s.
+fn build_upstream(cfg: &Cfg, url: &str, body: &Value) -> reqwest::RequestBuilder {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
+    let rb = cfg
+        .client
+        .post(url)
+        .headers(cfg.upstream_headers())
+        .json(body);
+    if streaming {
+        rb.timeout(std::time::Duration::from_secs(3600))
+    } else {
+        rb.timeout(std::time::Duration::from_secs(300))
+    }
+}
+
 async fn call_grok(cfg: &Cfg, body: &Value) -> Result<reqwest::Response, String> {
     let url = format!("{UPSTREAM_BASE}/chat/completions");
 
     // First attempt with current token
-    let resp = cfg
-        .client
-        .post(&url)
-        .headers(cfg.upstream_headers())
-        .json(body)
+    let resp = build_upstream(cfg, &url, body)
         .send()
         .await
         .map_err(|e| format!("upstream: {e}"))?;
@@ -561,11 +632,7 @@ async fn call_grok(cfg: &Cfg, body: &Value) -> Result<reqwest::Response, String>
     if resp.status().as_u16() == 401 {
         eprintln!("[grok-proxy] upstream 401; re-reading auth.json");
         if cfg.reload_token() {
-            let resp = cfg
-                .client
-                .post(&url)
-                .headers(cfg.upstream_headers())
-                .json(body)
+            let resp = build_upstream(cfg, &url, body)
                 .send()
                 .await
                 .map_err(|e| format!("upstream retry: {e}"))?;
@@ -615,7 +682,7 @@ async fn call_with_chain(cfg: &Cfg, chat_req: &Value) -> Result<reqwest::Respons
             }
             let body_text = resp.text().await.unwrap_or_default();
             if is_quota_exhaustion(&body_text) || status == 401 || status == 403 {
-                return Err(format!("__QUOTA__:{status}:{body_text}"));
+                return Err(format!("__TERMINAL__:{status}:{body_text}"));
             }
             last_err = format!("upstream {status}: {body_text}");
         }
@@ -635,8 +702,9 @@ async fn call_with_chain(cfg: &Cfg, chat_req: &Value) -> Result<reqwest::Respons
                     return Ok(resp);
                 }
                 let body_text = resp.text().await.unwrap_or_default();
-                if is_quota_exhaustion(&body_text) {
-                    return Err(format!("__QUOTA__:{status}:{body_text}"));
+                // Auth failures are model-independent: stop walking.
+                if is_quota_exhaustion(&body_text) || status == 401 || status == 403 {
+                    return Err(format!("__TERMINAL__:{status}:{body_text}"));
                 }
                 last_err = format!("upstream {status}: {body_text}");
             }
@@ -648,15 +716,26 @@ async fn call_with_chain(cfg: &Cfg, chat_req: &Value) -> Result<reqwest::Respons
 
 // ─── Main handler: POST /v1/messages ────────────────────────────────────────
 
+/// `__TERMINAL__:401:body` → (401, "body") — the internal contract between
+/// call_with_chain (fail-closed stop) and handle_messages (error mapping).
+/// The body may itself contain ':' — only the first two separators split.
+fn parse_terminal(err: &str) -> Option<(u16, &str)> {
+    let rest = err.strip_prefix("__TERMINAL__:")?;
+    let (status_raw, body) = rest.split_once(':').unwrap_or((rest, ""));
+    let status = status_raw.parse::<u16>().ok()?;
+    Some((status, body))
+}
+
 async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("claude-grok-4.7")
         .to_string();
-    let slug = resolve_slug(&model);
+    let raw_slug = resolve_slug(&model);
+    let (slug, _suffix_effort) = split_effort(&raw_slug);
 
-    if !is_valid_slug(&slug) {
+    if !is_valid_slug(slug) {
         let err = json!({"type":"error","error":{"type":"not_found_error","message":format!("unsupported model id: {model}")}});
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -675,21 +754,21 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
     let resp = match call_with_chain(&cfg, &chat_req).await {
         Ok(r) => r,
         Err(e) => {
-            // Quota fail-closed: terminal 429 with retry-after
-            if e.starts_with("__QUOTA__") {
-                let parts: Vec<&str> = e.splitn(3, ':').collect();
-                let status = parts
-                    .get(1)
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(429);
-                let upstream_body = parts.get(2).copied().unwrap_or("quota exhausted");
-                let err = json!({"type":"error","error":{"type":"rate_limit_error","message":upstream_body}});
-                return Response::builder()
+            // Terminal upstream errors (quota, auth): fail-closed — no chain
+            // walk happened, no silent fallback.
+            if let Some((status, upstream_body)) = parse_terminal(&e) {
+                let (kind, retry_after) = match status {
+                    401 | 403 => ("authentication_error", None),
+                    _ => ("rate_limit_error", Some("3600")),
+                };
+                let err = json!({"type":"error","error":{"type":kind,"message":upstream_body}});
+                let mut rb = Response::builder()
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::TOO_MANY_REQUESTS))
-                    .header("content-type", "application/json")
-                    .header("retry-after", "3600")
-                    .body(full_body(Bytes::from(err.to_string())))
-                    .unwrap();
+                    .header("content-type", "application/json");
+                if let Some(ra) = retry_after {
+                    rb = rb.header("retry-after", ra);
+                }
+                return rb.body(full_body(Bytes::from(err.to_string()))).unwrap();
             }
             let err = json!({"type":"error","error":{"type":"api_error","message":e}});
             return Response::builder()
@@ -718,7 +797,7 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
     }
 
     if !is_stream {
-        // Non-streaming: collect and return as single JSON
+        // Non-streaming: collect and return as single Anthropic JSON
         let full: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
@@ -734,15 +813,54 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
             .pointer("/choices/0/message")
             .cloned()
             .unwrap_or(json!({}));
-        let text = choice.get("content").and_then(Value::as_str).unwrap_or("");
+        let finish_reason = full
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop");
+
+        // Build the content blocks: thinking + text + tool_use
+        let mut blocks: Vec<Value> = Vec::new();
+        if let Some(rc) = choice.get("reasoning_content").and_then(Value::as_str) {
+            if !rc.is_empty() {
+                blocks.push(json!({"type":"thinking","thinking":rc}));
+            }
+        }
+        if let Some(text) = choice.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                blocks.push(json!({"type":"text","text":text}));
+            }
+        }
+        if let Some(tool_calls) = choice.get("tool_calls").and_then(Value::as_array) {
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let args = tc
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
+                blocks.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
+            }
+        }
+        if blocks.is_empty() {
+            blocks.push(json!({"type":"text","text":""}));
+        }
+        let stop_reason = match finish_reason {
+            "tool_calls" => "tool_use",
+            "length" => "max_tokens",
+            _ => "end_turn",
+        };
         let usage = full.get("usage").cloned().unwrap_or(json!({}));
         let result = json!({
             "id": format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [{"type":"text","text":text}],
-            "stop_reason": "end_turn",
+            "content": blocks,
+            "stop_reason": stop_reason,
             "stop_sequence": null,
             "usage": {
                 "input_tokens": usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
@@ -769,6 +887,7 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
         let mut in_tool: Option<(usize, String)> = None; // (index, name)
         let mut text_block_index: Option<usize> = None; // text block needs explicit start
         let mut output_tokens: u64 = 0;
+        let mut input_tokens: u64 = 0;
         let mut stop_reason = "end_turn";
         let mut last_activity = std::time::Instant::now();
         let mut send_failed = false;
@@ -824,7 +943,9 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
                                 if let Some(tbi) = text_block_index.take() {
                                     let _ = tx.send(content_block_stop(tbi)).await;
                                 }
-                                let _ = tx.send(message_delta(stop_reason, output_tokens)).await;
+                                let _ = tx
+                                    .send(message_delta(stop_reason, input_tokens, output_tokens))
+                                    .await;
                                 let _ = tx.send(message_stop()).await;
                                 send_failed = true; // signal end
                                 break;
@@ -836,6 +957,9 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
 
                             // Usage from final chunk
                             if let Some(u) = v.get("usage") {
+                                if let Some(pt) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                                    input_tokens = pt;
+                                }
                                 if let Some(ot) = u.get("completion_tokens").and_then(Value::as_u64)
                                 {
                                     output_tokens = ot;
@@ -849,6 +973,16 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
                             {
                                 if !rc.is_empty() {
                                     if !in_thinking {
+                                        // A thinking block never shares an index
+                                        // with an open text/tool block.
+                                        if let Some(tbi) = text_block_index.take() {
+                                            let _ = tx.send(content_block_stop(tbi)).await;
+                                            block_index = tbi + 1;
+                                        }
+                                        if let Some((prev_idx, _)) = in_tool.take() {
+                                            let _ = tx.send(content_block_stop(prev_idx)).await;
+                                            block_index = prev_idx + 1;
+                                        }
                                         let _ = tx
                                             .send(content_block_start(block_index, "thinking"))
                                             .await;
@@ -868,9 +1002,8 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
                                         in_thinking = false;
                                         block_index += 1;
                                     }
-                                    if let Some((idx, _)) = in_tool.clone() {
+                                    if let Some((idx, _)) = in_tool.take() {
                                         let _ = tx.send(content_block_stop(idx)).await;
-                                        in_tool = None;
                                         block_index = idx + 1;
                                     }
                                     // Emit content_block_start("text") once, then deltas
@@ -886,13 +1019,12 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
                             // tool_calls → tool_use block
                             if let Some(tc) = delta.get("tool_calls").and_then(Value::as_array) {
                                 for call in tc {
-                                    let _idx =
-                                        call.get("index").and_then(Value::as_u64).unwrap_or(0)
-                                            as usize;
                                     if let Some(name) =
                                         call.pointer("/function/name").and_then(Value::as_str)
                                     {
-                                        // Close thinking and text if open
+                                        // Close every open block before starting
+                                        // a new tool_use (parallel tool calls arrive
+                                        // as successive named deltas).
                                         if in_thinking {
                                             let _ = tx.send(content_block_stop(block_index)).await;
                                             in_thinking = false;
@@ -902,8 +1034,25 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
                                             let _ = tx.send(content_block_stop(tbi)).await;
                                             block_index = tbi + 1;
                                         }
+                                        if let Some((prev_idx, _)) = in_tool.take() {
+                                            let _ = tx.send(content_block_stop(prev_idx)).await;
+                                            block_index = prev_idx + 1;
+                                        }
+                                        let id = call
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .filter(|s| !s.is_empty());
+                                        let id = id.map(String::from).unwrap_or_else(|| {
+                                            format!(
+                                                "toolu_{}",
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_nanos()
+                                            )
+                                        });
                                         let _ = tx
-                                            .send(content_block_start(block_index, "tool_use"))
+                                            .send(content_block_start_tool(block_index, &id, name))
                                             .await;
                                         in_tool = Some((block_index, name.to_string()));
                                         stop_reason = "tool_use";
@@ -951,7 +1100,9 @@ async fn handle_messages(cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
             if let Some(tbi) = text_block_index.take() {
                 let _ = tx.send(content_block_stop(tbi)).await;
             }
-            let _ = tx.send(message_delta(stop_reason, output_tokens)).await;
+            let _ = tx
+                .send(message_delta(stop_reason, input_tokens, output_tokens))
+                .await;
             let _ = tx.send(message_stop()).await;
         }
         drop(tx);
@@ -1039,6 +1190,12 @@ async fn route(cfg: Arc<Cfg>, req: Request<Incoming>) -> Response<BoxBody> {
                     .unwrap();
             }
         };
+        if bytes.len() > BODY_CAP {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(full_body(Bytes::from("{\"error\":\"body too large\"}")))
+                .unwrap();
+        }
         let text = String::from_utf8_lossy(&bytes);
         let n = estimate_tokens(&text);
         let out = json!({"input_tokens": n});
@@ -1293,5 +1450,150 @@ mod tests {
     fn test_sse_event_format() {
         let ev = sse_event("ping", &json!({"type":"ping"}));
         assert!(ev.starts_with("event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+    }
+
+    #[test]
+    fn test_split_effort() {
+        assert_eq!(split_effort("grok-4.7"), ("grok-4.7", None));
+        assert_eq!(split_effort("grok-4.7:high"), ("grok-4.7", Some("high")));
+        assert_eq!(
+            split_effort("grok-4.7-build-fast:low"),
+            ("grok-4.7-build-fast", Some("low"))
+        );
+        // Invalid effort stays part of the slug → fails model validation
+        assert_eq!(
+            split_effort("grok-4.7:ultracode"),
+            ("grok-4.7:ultracode", None)
+        );
+        assert_eq!(split_effort("grok-4.7:"), ("grok-4.7:", None));
+    }
+
+    #[test]
+    fn test_effort_suffix_model() {
+        let req = json!({"model":"claude-grok-4.7:high","max_tokens":10,"messages":[]});
+        let out = convert_to_chat(&req);
+        assert_eq!(out["model"], "grok-4.7");
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_effort_output_config_wins_over_suffix() {
+        let req = json!({
+            "model":"claude-grok-4.7:low",
+            "max_tokens":10,
+            "output_config":{"effort":"high"},
+            "messages":[]
+        });
+        let out = convert_to_chat(&req);
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_system_array_blocks() {
+        // Modern Claude Code sends system as an array of text blocks
+        let req = json!({
+            "model":"claude-grok-4.7","max_tokens":10,
+            "system":[{"type":"text","text":"You are Claude Code"},{"type":"text","text":"Be brief"}],
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let out = convert_to_chat(&req);
+        assert_eq!(out["messages"][0]["role"], "system");
+        assert_eq!(
+            out["messages"][0]["content"],
+            "You are Claude Code\nBe brief"
+        );
+        assert_eq!(out["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn test_tool_result_with_text_not_dropped() {
+        let req = json!({
+            "model":"claude-grok-4.7","max_tokens":10,
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"42"},
+                    {"type":"text","text":"and also this"}
+                ]}
+            ]
+        });
+        let out = convert_to_chat(&req);
+        assert_eq!(out["messages"][0]["role"], "tool");
+        assert_eq!(out["messages"][0]["tool_call_id"], "t1");
+        assert_eq!(out["messages"][0]["content"], "42");
+        assert_eq!(out["messages"][1]["role"], "user");
+        assert_eq!(out["messages"][1]["content"], "and also this");
+    }
+
+    #[test]
+    fn test_tool_result_array_content() {
+        let req = json!({
+            "model":"claude-grok-4.7","max_tokens":10,
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"part a"},{"type":"text","text":"part b"}]}
+                ]}
+            ]
+        });
+        let out = convert_to_chat(&req);
+        assert_eq!(out["messages"][0]["role"], "tool");
+        assert_eq!(out["messages"][0]["content"], "part apart b");
+    }
+
+    #[test]
+    fn test_tool_choice_mapping() {
+        let base = json!({
+            "model":"claude-grok-4.7","max_tokens":10,
+            "tools":[{"name":"get_time","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let mut req = base.clone();
+        req["tool_choice"] = json!({"type":"any"});
+        assert_eq!(convert_to_chat(&req)["tool_choice"], "required");
+
+        let mut req = base.clone();
+        req["tool_choice"] = json!({"type":"none"});
+        assert_eq!(convert_to_chat(&req)["tool_choice"], "none");
+
+        let mut req = base.clone();
+        req["tool_choice"] = json!({"type":"tool","name":"get_time"});
+        let out = convert_to_chat(&req);
+        assert_eq!(out["tool_choice"]["type"], "function");
+        assert_eq!(out["tool_choice"]["function"]["name"], "get_time");
+
+        let out = convert_to_chat(&base);
+        assert_eq!(out["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_content_block_start_tool_has_id_and_name() {
+        let ev = content_block_start_tool(3, "toolu_abc", "get_time");
+        assert!(ev.contains("\"index\":3"));
+        assert!(ev.contains("\"type\":\"tool_use\""));
+        assert!(ev.contains("\"id\":\"toolu_abc\""));
+        assert!(ev.contains("\"name\":\"get_time\""));
+        assert!(ev.contains("\"input\":{}"));
+    }
+
+    #[test]
+    fn test_message_delta_has_input_tokens() {
+        let ev = message_delta("end_turn", 120, 45);
+        assert!(ev.contains("\"input_tokens\":120"));
+        assert!(ev.contains("\"output_tokens\":45"));
+        assert!(ev.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[test]
+    fn test_parse_terminal() {
+        assert_eq!(
+            parse_terminal("__TERMINAL__:401:token expired"),
+            Some((401, "token expired"))
+        );
+        // body with colons stays intact
+        assert_eq!(
+            parse_terminal("__TERMINAL__:429:quota: is: exhausted"),
+            Some((429, "quota: is: exhausted"))
+        );
+        assert_eq!(parse_terminal("__TERMINAL__:403:"), Some((403, "")));
+        assert_eq!(parse_terminal("upstream: network error"), None);
     }
 }

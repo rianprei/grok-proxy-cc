@@ -11,15 +11,16 @@ Type=simple
 # Local client-auth secret (unrelated to the Grok OIDC token).
 # Generate: echo "GROK_MASTER_KEY=$(cat /proc/sys/kernel/random/uuid | tr -d '-')" > ~/.config/grok-proxy-cc/proxy.env
 EnvironmentFile=%h/.config/grok-proxy-cc/proxy.env
-# Overclock: single arena malloc, no swap, OOM-protected, high priority.
+# Overclock: single arena malloc, no swap.
+# NOTE: no negative Nice=/OOMScoreAdjust= here — this is a --user unit and
+# the user manager lacks CAP_SYS_NICE/CAP_SYS_RESOURCE; negative values
+# abort the start ("Failed at step NICE").
 Environment=MALLOC_ARENA_MAX=2
 Environment=GROK_PROXY_ADDR=127.0.0.1:4112
 MemoryMin=16M
 MemoryHigh=192M
 MemoryMax=256M
 MemorySwapMax=0
-OOMScoreAdjust=-500
-Nice=-10
 CPUWeight=100
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0

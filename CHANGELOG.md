@@ -5,6 +5,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-10-16
+
+### Fixed
+
+- **tool_use blocks now carry `id` and `name` in `content_block_start`** —
+  previously the start event was emitted with an empty name and no id,
+  making streamed tool calls undispatchable by the client.
+- **Streaming index collisions**: a second named `tool_calls` delta (parallel
+  tool calls) re-used the open block's index without closing it; a
+  `reasoning_content` delta arriving after text/tool did the same. Every
+  block now closes the previous one before starting, keeping indexes
+  sequential.
+- **System prompt as text-block array** (the format modern Claude Code
+  sends) was silently dropped — now converted like string system prompts.
+- **Text blocks sibling to `tool_result` in `role:user` messages** are no
+  longer discarded; they become a trailing user message.
+- **`tool_choice` mapping**: `any` → `required`, `tool` → forced function,
+  `none` → `none` (previously everything degraded to `auto`).
+- **Non-streaming responses** now include thinking and `tool_use` content
+  blocks and a real `stop_reason` (`tool_use`/`max_tokens`/`end_turn`)
+  instead of always `end_turn` with text-only content.
+- **Long streams no longer killed at 300s**: reqwest's total timeout covers
+  the whole body read — healthy thinking generations over 5 minutes died
+  mid-stream. Streams now run under a 1h ceiling with the existing 300s
+  idle watchdog; non-streaming JSON keeps the hard 300s cap.
+- **401/403 after token reload** surface as `authentication_error` instead
+  of `rate_limit_error` with `retry-after: 3600` (a 1h wait on an auth
+  problem); auth failures are now terminal in the chain walk too.
+- **`count_tokens` respects the 32 MB body cap** like `/v1/messages`.
+- **`message_delta` now reports `input_tokens`** from the upstream usage
+  chunk alongside `output_tokens`.
+- Model `:effort` suffix (`claude-grok-4.7:high`), documented since 0.1.0,
+  actually works now — it previously 404'd as an unknown model. Precedence:
+  `output_config.effort` > `:effort` suffix > `thinking.budget_tokens`.
+
+### Changed
+
+- `deploy/grok-proxy-cc.service`: removed `Nice=-10` and
+  `OOMScoreAdjust=-500` — the unit runs under `systemctl --user`, whose
+  manager lacks `CAP_SYS_NICE`/`CAP_SYS_RESOURCE`; negative values aborted
+  the start ("Failed at step NICE").
+- README: `mkdir -p` for the env-file dir and the binary install step for
+  the systemd unit (`ExecStart=%h/.local/bin/grok-proxy-cc`).
+
 ## [0.1.0] — 2026-10-16
 
 ### Added
