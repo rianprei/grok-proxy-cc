@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (zero warnings enforced)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Binary size
+        run: |
+          SIZE=$(stat -c%s target/release/grok-proxy-cc)
+          echo "Binary: $SIZE bytes ($((SIZE / 1024)) KB)"
+          # Budget: release binary must stay under 5 MB (pre-UPX).
+          if [ "$SIZE" -gt 5242880 ]; then
+            echo "::error::Binary exceeds 5 MB budget ($SIZE bytes)"
+            exit 1
+          fi

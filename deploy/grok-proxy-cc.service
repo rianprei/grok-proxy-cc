@@ -1,0 +1,47 @@
+[Unit]
+Description=grok-proxy-cc — Anthropic-compatible proxy reusing ~/.grok/auth.json
+Documentation=https://github.com/rianprei/grok-proxy-cc
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Local client-auth secret (unrelated to the Grok OIDC token).
+# Generate: echo "GROK_MASTER_KEY=$(cat /proc/sys/kernel/random/uuid | tr -d '-')" > ~/.config/grok-proxy-cc/proxy.env
+EnvironmentFile=%h/.config/grok-proxy-cc/proxy.env
+# Overclock: single arena malloc, no swap, OOM-protected, high priority.
+Environment=MALLOC_ARENA_MAX=2
+Environment=GROK_PROXY_ADDR=127.0.0.1:4112
+MemoryMin=16M
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+OOMScoreAdjust=-500
+Nice=-10
+CPUWeight=100
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+LimitNOFILE=524288
+TasksMax=256
+ExecStart=%h/.local/bin/grok-proxy-cc
+Restart=always
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+UMask=0077
+
+# Hardening: the proxy only reads ~/.grok/auth.json (grok CLI writes it).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target
