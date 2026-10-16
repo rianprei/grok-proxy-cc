@@ -34,14 +34,16 @@ fn full_body(data: impl Into<Bytes>) -> BoxBody {
 const UPSTREAM_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const CLI_VERSION: &str = "1.0.52";
 
-/// Static model table: (public id suffix, upstream slug, display, behavesAs tier)
+/// Static model table: (public id suffix, display) — verified against upstream /v1/models 2026-10-16.
 const MODELS: &[(&str, &str)] = &[
     ("grok-4.7", "Grok 4.7"),
     ("grok-4.7-build-fast", "Grok 4.7 Build Fast"),
+    ("grok-4.6", "Grok 4.6"),
+    ("grok-4.5", "Grok 4.5"),
 ];
 
-/// Same-provider fallback chain (like codex-proxy-cc and claude-nim).
-const CHAIN_DEFAULT: &[&str] = &["grok-4.7", "grok-4.7-build-fast"];
+/// Same-provider fallback chain.
+const CHAIN_DEFAULT: &[&str] = &["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
 
 const BODY_CAP: usize = 32 * 1024 * 1024; // 32MB
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -94,16 +96,55 @@ fn load_grok_token() -> Result<(String, String), String> {
 
 struct Cfg {
     client: reqwest::Client,
-    token: String,
+    /// OIDC token, re-readable from auth.json on 401 (RwLock: reads on the
+    /// hot path, one write per refresh — the grok CLI refreshes the file
+    /// in place; the proxy picks the new token up without a restart).
+    token: std::sync::RwLock<String>,
+    /// Path to auth.json (re-read on upstream 401).
+    auth_path: std::path::PathBuf,
     master_key: String,
     addr: std::net::SocketAddr,
 }
 
 impl Cfg {
+    fn token_now(&self) -> String {
+        self.token.read().unwrap().clone()
+    }
+
+    /// Re-read ~/.grok/auth.json and swap the token. Returns true if the
+    /// file yielded a different, non-empty token.
+    fn reload_token(&self) -> bool {
+        match std::fs::read_to_string(&self.auth_path) {
+            Ok(raw) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(map) = v.as_object() {
+                        for (_k, entry) in map {
+                            let key = entry
+                                .get("key")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if !key.is_empty() {
+                                let mut lock = self.token.write().unwrap();
+                                if *lock != key {
+                                    eprintln!("[grok-proxy] token reloaded from auth.json");
+                                    *lock = key.to_string();
+                                    return true;
+                                }
+                                return false;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Identity headers the cli-chat-proxy gates on (confirmed by live gate test).
     fn upstream_headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
-        let bearer = format!("Bearer {}", self.token);
+        let bearer = format!("Bearer {}", self.token_now());
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&bearer) {
             h.insert(reqwest::header::AUTHORIZATION, v);
         }
@@ -454,13 +495,36 @@ fn parse_addr() -> std::net::SocketAddr {
 
 async fn call_grok(cfg: &Cfg, body: &Value) -> Result<reqwest::Response, String> {
     let url = format!("{UPSTREAM_BASE}/chat/completions");
-    cfg.client
+
+    // First attempt with current token
+    let resp = cfg
+        .client
         .post(&url)
         .headers(cfg.upstream_headers())
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("upstream: {e}"))
+        .map_err(|e| format!("upstream: {e}"))?;
+
+    // 401: the OIDC token expired (6h lifetime) — re-read auth.json
+    // (the grok CLI refreshes it in place) and retry ONCE.
+    if resp.status().as_u16() == 401 {
+        eprintln!("[grok-proxy] upstream 401; re-reading auth.json");
+        if cfg.reload_token() {
+            let resp = cfg
+                .client
+                .post(&url)
+                .headers(cfg.upstream_headers())
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| format!("upstream retry: {e}"))?;
+            return Ok(resp);
+        }
+        eprintln!("[grok-proxy] auth.json unchanged — token may be stale; run `grok login`");
+    }
+
+    Ok(resp)
 }
 
 /// Try the selected slug, then walk the chain on 429/5xx (non-quota).
@@ -648,7 +712,6 @@ async fn handle_messages(
         let mut in_thinking = false;
         let mut in_tool: Option<(usize, String)> = None; // (index, name)
         let mut text_block_index: Option<usize> = None; // text block needs explicit start
-        let mut has_content = false;
         let mut output_tokens: u64 = 0;
         let mut stop_reason = "end_turn";
         let mut last_activity = std::time::Instant::now();
@@ -723,7 +786,6 @@ async fn handle_messages(
                                         in_thinking = true;
                                     }
                                     let _ = tx.send(content_block_delta_thinking(block_index, rc)).await;
-                                    has_content = true;
                                 }
                             }
 
@@ -746,7 +808,6 @@ async fn handle_messages(
                                         text_block_index = Some(block_index);
                                     }
                                     let _ = tx.send(content_block_delta_text(block_index, c)).await;
-                                    has_content = true;
                                 }
                             }
 
@@ -767,7 +828,6 @@ async fn handle_messages(
                                         }
                                         let _ = tx.send(content_block_start(block_index, "tool_use")).await;
                                         in_tool = Some((block_index, name.to_string()));
-                                        has_content = true;
                                         stop_reason = "tool_use";
                                     }
                                     if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
@@ -985,7 +1045,8 @@ fn main() {
 
     let cfg = Arc::new(Cfg {
         client,
-        token,
+        token: std::sync::RwLock::new(token),
+        auth_path: grok_home().join("auth.json"),
         master_key,
         addr,
     });
