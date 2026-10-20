@@ -325,14 +325,20 @@ fn convert_to_chat(req: &Value) -> Value {
                                 match block.get("type").and_then(Value::as_str) {
                                     Some("text") => {
                                         text_parts.push(
-                                            block.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                                            block
+                                                .get("text")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
                                         );
                                     }
                                     Some("thinking") => {
                                         // Preserve previous reasoning in history —
                                         // dropping this causes the model to
                                         // contradict its earlier decisions.
-                                        if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                                        if let Some(t) =
+                                            block.get("thinking").and_then(Value::as_str)
+                                        {
                                             thinking_parts.push(t.to_string());
                                         }
                                     }
@@ -402,6 +408,15 @@ fn convert_to_chat(req: &Value) -> Value {
         obj.insert("max_tokens".into(), json!(mt.clamp(1, 65536)));
     }
 
+    // temperature, top_p — forwarded when present (Claude Code sends them
+    // for fine-grained control; the grok API accepts both).
+    if let Some(t) = req.get("temperature") {
+        obj.insert("temperature".into(), t.clone());
+    }
+    if let Some(t) = req.get("top_p") {
+        obj.insert("top_p".into(), t.clone());
+    }
+
     // Tools
     if let Some(tools) = req.get("tools").and_then(Value::as_array) {
         let converted: Vec<Value> = tools
@@ -427,6 +442,9 @@ fn convert_to_chat(req: &Value) -> Value {
                 _ => json!("auto"),
             };
             obj.insert("tool_choice".into(), choice);
+            // parallel_tool_calls: true (default) — Claude Code uses parallel
+            // tool calls; the grok API supports them.
+            obj.insert("parallel_tool_calls".into(), json!(true));
         }
     }
 
