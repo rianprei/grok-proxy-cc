@@ -264,7 +264,7 @@ fn convert_to_chat(req: &Value) -> Value {
                     });
                     if has_tool_results {
                         if let Some(arr) = content.and_then(Value::as_array) {
-                            let mut text_parts: Vec<&str> = Vec::new();
+                            let mut text_parts: Vec<String> = Vec::new();
                             for b in arr {
                                 match b.get("type").and_then(Value::as_str) {
                                     Some("tool_result") => {
@@ -280,8 +280,26 @@ fn convert_to_chat(req: &Value) -> Value {
                                     }
                                     Some("text") => {
                                         text_parts.push(
-                                            b.get("text").and_then(Value::as_str).unwrap_or(""),
+                                            b.get("text")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
                                         );
+                                    }
+                                    Some("tool_reference") => {
+                                        // Claude Code 2.1.300+ sends tool_reference
+                                        // blocks; convert to text so the model
+                                        // sees the context (grok API has no
+                                        // tool reference concept).
+                                        let name =
+                                            b.get("name").and_then(Value::as_str).unwrap_or("");
+                                        let rid = b.get("id").and_then(Value::as_str).unwrap_or("");
+                                        let text = if rid.is_empty() {
+                                            format!("[tool_reference: {name}]")
+                                        } else {
+                                            format!("[tool_reference: {name} ({rid})]")
+                                        };
+                                        text_parts.push(text);
                                     }
                                     _ => {}
                                 }
@@ -447,6 +465,16 @@ fn convert_content_to_text(content: Option<&Value>) -> String {
                         // Inline tool results
                         let inner = b.get("content").and_then(Value::as_str).unwrap_or("");
                         Some(format!("[tool_result: {inner}]"))
+                    }
+                    "tool_reference" => {
+                        // Claude Code 2.1.300+ tool references
+                        let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                        let rid = b.get("id").and_then(Value::as_str).unwrap_or("");
+                        Some(if rid.is_empty() {
+                            format!("[tool_reference: {name}]")
+                        } else {
+                            format!("[tool_reference: {name} ({rid})]")
+                        })
                     }
                     "image" => Some("[image]".into()),
                     _ => None,
