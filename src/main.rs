@@ -318,14 +318,26 @@ fn convert_to_chat(req: &Value) -> Value {
                     if let Some(obj_a) = a.as_object_mut() {
                         let content = m.get("content");
                         if let Some(arr_c) = content.and_then(Value::as_array) {
-                            let mut text_parts = Vec::new();
+                            let mut text_parts: Vec<String> = Vec::new();
+                            let mut thinking_parts: Vec<String> = Vec::new();
                             let mut tool_calls = Vec::new();
                             for block in arr_c {
                                 match block.get("type").and_then(Value::as_str) {
                                     Some("text") => {
                                         text_parts.push(
-                                            block.get("text").and_then(Value::as_str).unwrap_or(""),
+                                            block.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
                                         );
+                                    }
+                                    Some("thinking") => {
+                                        // Preserve previous reasoning in history —
+                                        // dropping this causes the model to
+                                        // contradict its earlier decisions.
+                                        if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                                            thinking_parts.push(t.to_string());
+                                        }
+                                    }
+                                    Some("redacted_thinking") => {
+                                        thinking_parts.push("[redacted thinking]".to_string());
                                     }
                                     Some("tool_use") => {
                                         let id =
@@ -340,8 +352,19 @@ fn convert_to_chat(req: &Value) -> Value {
                                     _ => {}
                                 }
                             }
+                            // Reasoning first, then content — mirrors how the
+                            // model actually produced the response.
+                            let mut full_content = String::new();
+                            if !thinking_parts.is_empty() {
+                                full_content.push_str("<thinking>\n");
+                                full_content.push_str(&thinking_parts.join("\n"));
+                                full_content.push_str("\n</thinking>\n");
+                            }
                             if !text_parts.is_empty() {
-                                obj_a.insert("content".into(), json!(text_parts.join("")));
+                                full_content.push_str(&text_parts.join(""));
+                            }
+                            if !full_content.is_empty() {
+                                obj_a.insert("content".into(), json!(full_content));
                             }
                             if !tool_calls.is_empty() {
                                 obj_a.insert("tool_calls".into(), json!(tool_calls));
